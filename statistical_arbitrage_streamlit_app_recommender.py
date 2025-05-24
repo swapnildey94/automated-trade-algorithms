@@ -456,7 +456,8 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
                 
                 # Update status less frequently to avoid slowing down Streamlit
                 if iteration_count % 10 == 0 or iteration_count == valid_combinations :
-                     status_text.text(f"Optimizing: Combination {iteration_count}/{valid_combinations} | Current Best PnL: ${best_pnl:.2f if best_pnl != -np.inf else 'N/A'}")
+                     current_best_pnl = "N/A" if best_pnl == -np.inf else f"${best_pnl:.2f}"
+                     status_text.text(f"Optimizing: Combination {iteration_count}/{valid_combinations} | Current Best PnL: {current_best_pnl}")
                 
                 pnl = run_backtest_for_optimization(
                     current_params,
