@@ -652,8 +652,8 @@ if run_button or optimize_button: # Common data prep for both actions
             secondary_y=True,
         )
         fig_prices_plotly.update_layout(title_text='Price History', xaxis_title='Date', legend_title_text='Assets')
-        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_a_symbol} Price</b>", secondary_y=False, color='blue')
-        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_b_symbol} Price</b>", secondary_y=True, color='red')
+        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_a_symbol} Price</b>", secondary_y=False, color='blue') # type: ignore
+        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_b_symbol} Price</b>", secondary_y=True, color='red') # type: ignore
         st.plotly_chart(fig_prices_plotly, use_container_width=True)
 
         st.subheader("📉 Z-Score of the Spread with Trade Signals (Interactive)")
