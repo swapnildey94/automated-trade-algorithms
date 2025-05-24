@@ -462,8 +462,8 @@ if not product_display_names:
     st.sidebar.error("No suitable products found from API to populate dropdowns.")
     st.stop()
     
-default_a_symbol_desc = next((s for s in product_display_names if "BTC" in s.upper()), product_display_names[0])
-default_b_symbol_desc = next((s for s in product_display_names if "ETH" in s.upper() and s != default_a_symbol_desc), 
+default_a_symbol_desc = next((s for s in product_display_names if "BTCUSD" in s.upper()), product_display_names[0])
+default_b_symbol_desc = next((s for s in product_display_names if "ETHUSD" in s.upper() and s != default_a_symbol_desc), 
                              product_display_names[1] if len(product_display_names) > 1 else product_display_names[0])
 
 
