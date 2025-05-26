@@ -380,7 +380,7 @@ if run_button or optimize_button:
             context_data.append({"Parameter": "Latest Timestamp", "Value": latest_full_data_point.name.strftime('%Y-%m-%d %H:%M:%S')})
             context_data.append({"Parameter": f"Primary Asset ({primary_asset_sym}) Price", "Value": f"${primary_price_latest_val:.2f}"})
             context_data.append({"Parameter": f"Secondary Asset ({secondary_asset_sym}) Price", "Value": f"${secondary_price_latest_val:.2f}"})
-            context_data.append({"Parameter": "Latest Hedge Ratio (β)", "Value": f"{hedge_ratio_latest_val:.4f}" if pd.notna(hedge_ratio_latest_val) else "N/A"})
+            context_data.append({"Parameter": "Latest Hedge Ratio (\u03B2)", "Value": f"{hedge_ratio_latest_val:.4f}" if pd.notna(hedge_ratio_latest_val) else "N/A"})
             context_data.append({"Parameter": "Latest Z-score", "Value": f"{latest_zscore_val:.4f}" if pd.notna(latest_zscore_val) else "N/A"})
             
             context_data.append({"Parameter": "--- Strategy Parameters ---", "Value": "--- ---"}) # Separator
@@ -398,6 +398,13 @@ if run_button or optimize_button:
                 context_data.append({"Parameter": "Calculated Secondary Quantity", "Value": f"{secondary_qty_calc:.6f} {secondary_asset_sym}"})
             else:
                 context_data.append({"Parameter": "Calculated Secondary Quantity", "Value": "N/A (Invalid inputs for calculation)"})
+
+            # --- LOGGING LATEST CONTEXT ---
+            try:
+                from utils import log_latest_context
+                log_latest_context(context_data)
+            except Exception as e:
+                st.warning(f"Could not log latest trade context: {e}")
 
             context_df = pd.DataFrame(context_data)
             st.table(context_df.set_index("Parameter")) # Using st.table for a cleaner look

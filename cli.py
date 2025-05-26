@@ -68,4 +68,45 @@ def run_analysis_cli(
         detailed_trade_log.to_csv(log_file_path, index=False)
         print(f"[SUCCESS] Trade log written to {log_file_path}")
         print(f"[SUMMARY] Net P&L: ${detailed_trade_log['Net PnL (USD)'].sum():.2f} | Total Trades: {len(detailed_trade_log)}")
+
+    # --- LOGGING LATEST CONTEXT ---
+    try:
+        from utils import log_latest_context
+        # Build context_data similar to Streamlit app
+        latest_full_data = data_with_z.join(trade_signals[['signal','position']], how='left').dropna(subset=['zscore', 'close_a', 'close_b', 'hedge_ratio'])
+        if not latest_full_data.empty:
+            latest_full_data_point = latest_full_data.iloc[-1]
+            price_a_latest = latest_full_data_point['close_a']
+            price_b_latest = latest_full_data_point['close_b']
+            hedge_ratio_latest_val = latest_full_data_point['hedge_ratio']
+            latest_zscore_val = latest_full_data_point['zscore']
+            latest_signal_action_val = latest_full_data_point['signal']
+            latest_position_val = latest_full_data_point['position']
+            primary_asset_sym = asset_a_symbol if primary_is_A else asset_b_symbol
+            secondary_asset_sym = asset_b_symbol if primary_is_A else asset_a_symbol
+            primary_price_latest_val = price_a_latest if primary_is_A else price_b_latest
+            secondary_price_latest_val = price_b_latest if primary_is_A else price_a_latest
+            context_data = []
+            context_data.append({"Parameter": "Latest Timestamp", "Value": latest_full_data_point.name.strftime('%Y-%m-%d %H:%M:%S')})
+            context_data.append({"Parameter": f"Primary Asset ({primary_asset_sym}) Price", "Value": f"${primary_price_latest_val:.2f}"})
+            context_data.append({"Parameter": f"Secondary Asset ({secondary_asset_sym}) Price", "Value": f"${secondary_price_latest_val:.2f}"})
+            context_data.append({"Parameter": "Latest Hedge Ratio (\u03B2)", "Value": f"{hedge_ratio_latest_val:.4f}" if pd.notna(hedge_ratio_latest_val) else "N/A"})
+            context_data.append({"Parameter": "Latest Z-score", "Value": f"{latest_zscore_val:.4f}" if pd.notna(latest_zscore_val) else "N/A"})
+            context_data.append({"Parameter": "--- Strategy Parameters ---", "Value": "--- ---"})
+            context_data.append({"Parameter": "Entry Z-score Threshold", "Value": f"{current_run_config['entry_threshold']:.2f}"})
+            context_data.append({"Parameter": "Exit Z-score Threshold", "Value": f"{current_run_config['exit_threshold']:.2f}"})
+            context_data.append({"Parameter": "Stop Loss Z-score Threshold", "Value": f"{current_run_config['stop_loss_threshold']:.2f}"})
+            context_data.append({"Parameter": "--- Trade Setup ---", "Value": "--- ---"})
+            context_data.append({"Parameter": "User Specified Primary Quantity", "Value": f"{quantity} {primary_asset_sym}"})
+            from backtesting import calculate_secondary_quantity
+            if pd.notna(hedge_ratio_latest_val) and primary_price_latest_val > 0 and secondary_price_latest_val > 0:
+                secondary_qty_calc = calculate_secondary_quantity(
+                    quantity, hedge_ratio_latest_val, primary_price_latest_val, secondary_price_latest_val, primary_is_A
+                )
+                context_data.append({"Parameter": "Calculated Secondary Quantity", "Value": f"{secondary_qty_calc:.6f} {secondary_asset_sym}"})
+            else:
+                context_data.append({"Parameter": "Calculated Secondary Quantity", "Value": "N/A (Invalid inputs for calculation)"})
+            log_latest_context(context_data)
+    except Exception as e:
+        print(f"[WARNING] Could not log latest trade context: {e}")
     return 0
