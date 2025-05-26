@@ -323,3 +323,5 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/intellij,java,python,jupyternotebooks
+
+trade_log_output*.csv

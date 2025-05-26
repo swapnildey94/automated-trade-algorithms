@@ -3,22 +3,29 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
-import statsmodels.api as sm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px # Added for correlation plot and OLS visualization
+import argparse
+# Modular imports
+from regression import calculate_hedge_ratio, calculate_zscore
+from backtesting import generate_trade_signals, generate_trade_log, calculate_secondary_quantity
+from visualization import plot_price_history, plot_correlation
+from scenario_analysis import run_scenario_analysis
+from optimization import optimize_strategy_parameters
+from cli import run_analysis_cli
 
 # --- Configuration (from notebook, can be adjusted in UI) ---
 DEFAULT_CONFIG = {
-    'timeframe': '1d', # Changed default to daily
+    'timeframe': '1h', # Changed default to hourly
     'lookback_period': 30, # days for hedge ratio/z-score calculation
-    'entry_threshold': 1.1,
+    'entry_threshold': 2.2,
     'exit_threshold': 0.3,
     'final_exit_threshold': 0.1, # Not currently used in generate_trade_signals
-    'stop_loss_threshold': 3.1,
+    'stop_loss_threshold': 3.5,
     'trading_fee': 0.001,
     'slippage': 0.001,
-    'start_date': (datetime.now() - timedelta(days=365)), # Extended default range for daily
+    'start_date': (datetime.now() - timedelta(days=120)), # Extended default range for daily
     'end_date': datetime.now(),
     'api_base_url': 'https://api.india.delta.exchange'
 }
@@ -79,361 +86,6 @@ def get_historical_candles(api_base_url, product_id, product_symbol, timeframe, 
     except Exception as e:
         st.error(f"Error fetching historical candles for {product_symbol}: {e}")
         return pd.DataFrame()
-
-# --- Statistical Arbitrage Algorithm Functions (from original script) ---
-def calculate_hedge_ratio(data_to_process, lookback_period_days, timeframe_selection):
-    """
-    Calculates the rolling hedge ratio (beta) using OLS regression on log prices.
-    lookback_period_days: Number of days to consider for each rolling calculation.
-    timeframe_selection: The candle timeframe (e.g., '1h', '1d') to determine points per day.
-    """
-    points_per_day = {
-        '1m': 24 * 60, '5m': 24 * 12, '15m': 24 * 4, '30m': 24 * 2,
-        '1h': 24, '2h': 12, '4h': 6, '6h': 4, '12h': 2, '1d': 1, '1w': 1/7, 'D': 1, 'W': 1/7
-    }
-    # Ensure timeframe_selection is valid, default to 1 if not found (e.g. for '1d')
-    lookback_points = int(lookback_period_days * points_per_day.get(timeframe_selection, 1)) # Default to 1 point per day if timeframe not in dict (e.g. '1D')
-    if lookback_points < 2: lookback_points = 2 # Minimum points for regression
-
-    data = data_to_process.copy()
-    data['hedge_ratio'] = np.nan
-    data['spread'] = np.nan
-    # Store intercept for potential visualization, though not strictly used by current strategy logic
-    data['ols_intercept'] = np.nan 
-
-    for i in range(lookback_points, len(data)):
-        # Slice data for the current lookback window
-        y_series = data['log_price_a'].iloc[i-lookback_points:i]
-        X_series = data['log_price_b'].iloc[i-lookback_points:i]
-        
-        # Ensure there's enough non-null data
-        if y_series.isnull().any() or X_series.isnull().any() or len(y_series) < 2 or len(X_series) < 2:
-            data.loc[data.index[i], 'hedge_ratio'] = np.nan 
-            data.loc[data.index[i], 'ols_intercept'] = np.nan
-            continue
-            
-        # Prepare data for OLS: y = log_price_a, X = const + log_price_b
-        X_with_const = sm.add_constant(X_series, prepend=True)
-        
-        try:
-            model = sm.OLS(y_series, X_with_const).fit()
-            # Ensure model fitting was successful and parameters are available
-            if len(model.params) > 1: # params are [const, beta]
-                 intercept = model.params.iloc[0]
-                 beta = model.params.iloc[1] # Beta is the hedge ratio
-                 data.loc[data.index[i], 'ols_intercept'] = intercept
-                 data.loc[data.index[i], 'hedge_ratio'] = beta
-                 # Calculate spread: log_price_a - beta * log_price_b
-                 data.loc[data.index[i], 'spread'] = data['log_price_a'].iloc[i] - beta * data['log_price_b'].iloc[i]
-            else:
-                data.loc[data.index[i], 'hedge_ratio'] = np.nan 
-                data.loc[data.index[i], 'ols_intercept'] = np.nan
-        except Exception: 
-            data.loc[data.index[i], 'hedge_ratio'] = np.nan
-            data.loc[data.index[i], 'ols_intercept'] = np.nan
-    return data
-
-def calculate_zscore(data_with_spread, lookback_period_days, timeframe_selection):
-    """
-    Calculates the Z-score of the spread.
-    lookback_period_days: Number of days for rolling mean and std dev of the spread.
-    timeframe_selection: The candle timeframe to determine points per day.
-    """
-    points_per_day = {
-        '1m': 24 * 60, '5m': 24 * 12, '15m': 24 * 4, '30m': 24 * 2,
-        '1h': 24, '2h': 12, '4h': 6, '6h': 4, '12h': 2, '1d': 1, '1w': 1/7, 'D': 1, 'W': 1/7
-    }
-    lookback_points = int(lookback_period_days * points_per_day.get(timeframe_selection, 1))
-    if lookback_points < 2: lookback_points = 2 # Min periods for rolling calculation
-
-    result_df = data_with_spread.copy()
-    # Calculate rolling mean and standard deviation of the spread
-    result_df['spread_ma'] = result_df['spread'].rolling(window=lookback_points, min_periods=max(1, lookback_points//2)).mean()
-    result_df['spread_std'] = result_df['spread'].rolling(window=lookback_points, min_periods=max(1, lookback_points//2)).std()
-    
-    # Calculate Z-score: (spread - spread_ma) / spread_std
-    result_df['zscore'] = (result_df['spread'] - result_df['spread_ma']) / result_df['spread_std']
-    return result_df
-
-def calculate_secondary_quantity(primary_quantity, hedge_ratio, primary_price, secondary_price, primary_is_asset_a):
-    """Calculates the quantity of the secondary asset to achieve a hedge."""
-    if primary_price == 0 or secondary_price == 0: return 0 
-    
-    primary_notional = primary_quantity * primary_price 
-
-    if primary_is_asset_a:
-        secondary_notional_target = primary_notional * hedge_ratio 
-        secondary_asset_quantity = secondary_notional_target / secondary_price if secondary_price != 0 else 0
-    else: 
-        if hedge_ratio == 0: return 0 
-        secondary_notional_target = primary_notional / hedge_ratio
-        secondary_asset_quantity = secondary_notional_target / secondary_price if secondary_price != 0 else 0
-    return abs(secondary_asset_quantity) 
-
-def generate_trade_signals(data_df, config_params):
-    """Generates trading signals based on Z-score thresholds."""
-    signals = pd.DataFrame(index=data_df.index)
-    signals['zscore'] = data_df['zscore']
-    signals['signal'] = 0.0  
-    signals['position'] = 0  
-
-    entry_thresh = config_params['entry_threshold']
-    exit_thresh = config_params['exit_threshold'] 
-    stop_loss_thresh = config_params['stop_loss_threshold'] 
-    current_pos = 0
-
-    for i in range(1, len(signals)): 
-        z = signals['zscore'].iloc[i]
-        prev_z = signals['zscore'].iloc[i-1]
-
-        if pd.isna(z) or pd.isna(prev_z): 
-            signals.loc[signals.index[i], 'position'] = current_pos
-            continue
-
-        if current_pos == 0: 
-            if prev_z >= -entry_thresh and z < -entry_thresh: 
-                signals.loc[signals.index[i], 'signal'] = 1.0
-                current_pos = 1
-            elif prev_z <= entry_thresh and z > entry_thresh: 
-                signals.loc[signals.index[i], 'signal'] = -1.0
-                current_pos = -1
-        elif current_pos == 1: 
-            if (prev_z <= -exit_thresh and z > -exit_thresh) or \
-               (prev_z >= -stop_loss_thresh and z < -stop_loss_thresh and stop_loss_thresh > entry_thresh): 
-                signals.loc[signals.index[i], 'signal'] = 2.0 
-                current_pos = 0
-        elif current_pos == -1: 
-            if (prev_z >= exit_thresh and z < exit_thresh) or \
-               (prev_z <= stop_loss_thresh and z > stop_loss_thresh and stop_loss_thresh > entry_thresh): 
-                signals.loc[signals.index[i], 'signal'] = 2.0 
-                current_pos = 0
-        
-        signals.loc[signals.index[i], 'position'] = current_pos
-        
-    signals['buy_signal_z'] = np.where(signals['signal'] == 1.0, signals['zscore'], np.nan)
-    signals['sell_signal_z'] = np.where(signals['signal'] == -1.0, signals['zscore'], np.nan)
-    signals['exit_signal_z'] = np.where(signals['signal'] == 2.0, signals['zscore'], np.nan)
-    return signals
-
-def generate_trade_log(signals_df, data_with_prices_hedge_ratio, global_config, user_primary_quantity, primary_is_A_selected):
-    """Generates a log of trades with P&L calculations."""
-    trade_log_list = []
-    active_trade = None
-    slippage = global_config['slippage']
-    trading_fee_rate = global_config['trading_fee']
-
-    required_cols = ['close_a', 'close_b', 'hedge_ratio', 'symbol_a', 'symbol_b']
-    if not all(col in data_with_prices_hedge_ratio.columns for col in required_cols):
-        st.error(f"Missing required columns in data for trade log: {required_cols}")
-        return pd.DataFrame()
-
-
-    for timestamp, row in signals_df.iterrows():
-        signal = row['signal']
-        zscore_at_signal = row['zscore']
-
-        if pd.isna(zscore_at_signal) or timestamp not in data_with_prices_hedge_ratio.index:
-            continue
-
-        current_price_a = data_with_prices_hedge_ratio.loc[timestamp, 'close_a']
-        current_price_b = data_with_prices_hedge_ratio.loc[timestamp, 'close_b']
-        current_hedge_ratio = data_with_prices_hedge_ratio.loc[timestamp, 'hedge_ratio']
-        symbol_a = data_with_prices_hedge_ratio.loc[timestamp, 'symbol_a'] 
-        symbol_b = data_with_prices_hedge_ratio.loc[timestamp, 'symbol_b'] 
-
-
-        if active_trade is None: 
-            if signal == 1.0 or signal == -1.0: 
-                if pd.isna(current_hedge_ratio) or current_price_a == 0 or current_price_b == 0:
-                    continue 
-                
-                qty_a, qty_b = 0, 0
-                if primary_is_A_selected:
-                    qty_a = user_primary_quantity
-                    qty_b = calculate_secondary_quantity(qty_a, current_hedge_ratio, current_price_a, current_price_b, True)
-                else: 
-                    qty_b = user_primary_quantity
-                    qty_a = calculate_secondary_quantity(qty_b, current_hedge_ratio, current_price_b, current_price_a, False) 
-                
-                if qty_a == 0 or qty_b == 0: continue 
-
-                trade_type_str = f'Buy Spread (L {symbol_a}, S {symbol_b})' if signal == 1.0 else f'Sell Spread (S {symbol_a}, L {symbol_b})'
-                active_trade = {
-                    'Entry Timestamp': timestamp, 'Trade Type': trade_type_str,
-                    'Entry Z-score': zscore_at_signal,
-                    'Entry Price A (Orig)': current_price_a, 'Entry Price B (Orig)': current_price_b,
-                    'Entry Hedge Ratio': current_hedge_ratio,
-                    'Qty A': qty_a, 'Qty B': qty_b, 'Primary is A': primary_is_A_selected,
-                    'Symbol A': symbol_a, 'Symbol B': symbol_b, 
-                    'Exit Timestamp': None, 'Exit Price A (Orig)': None, 'Exit Price B (Orig)': None, 'Exit Z-score': None,
-                    'PnL Asset A (USD)': None, 'PnL Asset B (USD)': None, 'Total Fees (USD)': None, 
-                    'Net PnL (USD)': None, 'PnL % (Primary Notional)': None
-                }
-        elif active_trade is not None: 
-            is_eod_closure = (timestamp == signals_df.index[-1] and active_trade['Exit Timestamp'] is None)
-            if signal == 2.0 or is_eod_closure: 
-                active_trade['Exit Timestamp'] = timestamp
-                active_trade['Exit Price A (Orig)'] = current_price_a
-                active_trade['Exit Price B (Orig)'] = current_price_b
-                active_trade['Exit Z-score'] = zscore_at_signal if signal == 2.0 else data_with_prices_hedge_ratio.loc[timestamp, 'zscore'] 
-
-                if is_eod_closure and signal != 2.0: 
-                     active_trade['Trade Type'] += ' (Closed at EOD)'
-                
-                entry_p_a = active_trade['Entry Price A (Orig)']
-                entry_p_b = active_trade['Entry Price B (Orig)']
-                exit_p_a = active_trade['Exit Price A (Orig)']
-                exit_p_b = active_trade['Exit Price B (Orig)']
-                q_a = active_trade['Qty A']
-                q_b = active_trade['Qty B']
-                
-                pnl_a_gross, pnl_b_gross, fee_a, fee_b = 0,0,0,0
-
-                if 'Buy Spread' in active_trade['Trade Type']: 
-                    eff_entry_a = entry_p_a * (1 + slippage) 
-                    eff_exit_a = exit_p_a * (1 - slippage)   
-                    pnl_a_gross = (eff_exit_a - eff_entry_a) * q_a
-                    fee_a = (q_a * abs(eff_entry_a) + q_a * abs(eff_exit_a)) * trading_fee_rate
-                    
-                    eff_entry_b_sell = entry_p_b * (1 - slippage) 
-                    eff_exit_b_buy = exit_p_b * (1 + slippage)   
-                    pnl_b_gross = (eff_entry_b_sell - eff_exit_b_buy) * q_b
-                    fee_b = (q_b * abs(eff_entry_b_sell) + q_b * abs(eff_exit_b_buy)) * trading_fee_rate
-                elif 'Sell Spread' in active_trade['Trade Type']: 
-                    eff_entry_a_sell = entry_p_a * (1 - slippage)
-                    eff_exit_a_buy = exit_p_a * (1 + slippage)
-                    pnl_a_gross = (eff_entry_a_sell - eff_exit_a_buy) * q_a
-                    fee_a = (q_a * abs(eff_entry_a_sell) + q_a * abs(eff_exit_a_buy)) * trading_fee_rate
-
-                    eff_entry_b = entry_p_b * (1 + slippage)
-                    eff_exit_b = exit_p_b * (1 - slippage)
-                    pnl_b_gross = (eff_exit_b - eff_entry_b) * q_b
-                    fee_b = (q_b * abs(eff_entry_b) + q_b * abs(eff_exit_b)) * trading_fee_rate
-                
-                active_trade['PnL Asset A (USD)'] = pnl_a_gross - fee_a
-                active_trade['PnL Asset B (USD)'] = pnl_b_gross - fee_b
-                active_trade['Total Fees (USD)'] = fee_a + fee_b
-                active_trade['Net PnL (USD)'] = (pnl_a_gross - fee_a) + (pnl_b_gross - fee_b)
-                
-                initial_primary_notional = 0
-                if active_trade['Primary is A']:
-                    initial_primary_notional = abs(q_a * entry_p_a) 
-                else:
-                    initial_primary_notional = abs(q_b * entry_p_b)
-                
-                active_trade['PnL % (Primary Notional)'] = (active_trade['Net PnL (USD)'] / initial_primary_notional) * 100 if initial_primary_notional != 0 else 0
-
-                trade_log_list.append(active_trade.copy())
-                active_trade = None 
-    return pd.DataFrame(trade_log_list)
-
-
-# --- Optimization Functions ---
-def run_backtest_for_optimization(params_dict, data_with_z_precalculated, base_config, quantity, primary_is_A):
-    """
-    Runs a single backtest iteration with a given set of parameters.
-    `data_with_z_precalculated` must contain 'zscore', 'close_a', 'close_b', 'hedge_ratio', 'symbol_a', 'symbol_b'.
-    """
-    iter_config = base_config.copy()
-    iter_config['entry_threshold'] = params_dict['entry_threshold']
-    iter_config['exit_threshold'] = params_dict['exit_threshold']
-    iter_config['stop_loss_threshold'] = params_dict['stop_loss_threshold']
-
-    trade_signals = generate_trade_signals(data_with_z_precalculated, iter_config)
-    
-    detailed_trade_log = generate_trade_log(
-        signals_df=trade_signals, 
-        data_with_prices_hedge_ratio=data_with_z_precalculated, 
-        global_config=iter_config, 
-        user_primary_quantity=quantity, 
-        primary_is_A_selected=primary_is_A
-    )
-
-    if not detailed_trade_log.empty:
-        total_pnl = detailed_trade_log['Net PnL (USD)'].sum()
-        return total_pnl
-    else:
-        return -np.inf 
-
-def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantity, primary_is_A):
-    """
-    Optimizes entry, exit, and stop-loss thresholds using grid search.
-    """
-    st.write("Starting parameter optimization...")
-
-    entry_thresholds = np.round(np.arange(0.8, 2.1, 0.2), 2)  
-    exit_thresholds = np.round(np.arange(0.1, 0.8, 0.1), 2)   
-    stop_loss_thresholds = np.round(np.arange(1.5, 3.6, 0.2), 2) 
-
-    best_pnl = -np.inf
-    best_params = {}
-    iteration_count = 0
-    
-    valid_combinations = 0
-    for entry_t in entry_thresholds:
-        for exit_t in exit_thresholds:
-            if exit_t >= entry_t: continue
-            for stop_loss_t in stop_loss_thresholds:
-                if stop_loss_t <= entry_t: continue 
-                if stop_loss_t <= exit_t: continue 
-                valid_combinations +=1
-    
-    if valid_combinations == 0:
-        st.warning("No valid parameter combinations to test with the defined ranges and constraints. Adjust ranges.")
-        return None, -np.inf
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    status_text.text(f"Optimizing... Total valid combinations to test: {valid_combinations}")
-
-
-    for entry_t in entry_thresholds:
-        for exit_t in exit_thresholds:
-            if exit_t >= entry_t:
-                continue
-
-            for stop_loss_t in stop_loss_thresholds:
-                if stop_loss_t <= entry_t:
-                    continue
-                if stop_loss_t <= exit_t: 
-                    continue
-
-                iteration_count += 1
-                current_params = {
-                    'entry_threshold': entry_t,
-                    'exit_threshold': exit_t,
-                    'stop_loss_threshold': stop_loss_t
-                }
-                
-                if iteration_count % 10 == 0 or iteration_count == valid_combinations :
-                     current_best_pnl = "N/A" if best_pnl == -np.inf else f"${best_pnl:.2f}"
-                     status_text.text(f"Optimizing: Combination {iteration_count}/{valid_combinations} | Current Best PnL: {current_best_pnl}")
-                
-                pnl = run_backtest_for_optimization(
-                    current_params,
-                    data_with_z_precalculated, 
-                    base_config,
-                    quantity,
-                    primary_is_A
-                )
-
-                if pnl > best_pnl:
-                    best_pnl = pnl
-                    best_params = current_params
-                
-                progress_bar.progress(iteration_count / valid_combinations)
-
-    status_text.text(f"Optimization complete! Processed {iteration_count} valid combinations.")
-    if iteration_count > 0 : progress_bar.progress(1.0) 
-    else: progress_bar.empty()
-
-
-    if best_pnl == -np.inf: 
-        st.warning("Optimization did not find any profitable trades with the tested parameter combinations.")
-        return None, -np.inf
-        
-    return best_params, best_pnl
-
 
 # --- Streamlit App UI ---
 st.set_page_config(layout="wide")
@@ -552,29 +204,18 @@ if run_button or optimize_button:
     asset_a_data['log_price'] = np.log(asset_a_data['close'])
     asset_b_data['log_price'] = np.log(asset_b_data['close'])
 
-    merged_df = pd.merge(
-        asset_a_data[['close', 'log_price']].add_prefix('a_'),
-        asset_b_data[['close', 'log_price']].add_prefix('b_'),
-        left_index=True, right_index=True, how='inner'
+    # Use scenario analysis module for all core calculations
+    scenario_result = run_scenario_analysis(
+        asset_a_data, asset_b_data, asset_a_symbol, asset_b_symbol, current_run_config, quantity, primary_is_A
     )
-    merged_df.rename(columns={'a_close': 'close_a', 'a_log_price': 'log_price_a',
-                              'b_close': 'close_b', 'b_log_price': 'log_price_b'}, inplace=True)
-    
-    merged_df['symbol_a'] = asset_a_symbol
-    merged_df['symbol_b'] = asset_b_symbol
-
-
-    if merged_df.empty:
-        st.warning("No overlapping data found for the selected assets and timeframe.")
+    if 'error' in scenario_result:
+        st.warning(scenario_result['error'])
         st.stop()
-
-    calc_spinner = st.spinner("Calculating hedge ratio, spread, and Z-score...")
-    with calc_spinner:
-        # Pass merged_df which has log_price_a and log_price_b
-        data_with_hedge = calculate_hedge_ratio(merged_df, current_run_config['lookback_period'], current_run_config['timeframe'])
-        data_with_z = calculate_zscore(data_with_hedge, current_run_config['lookback_period'], current_run_config['timeframe'])
-        # data_with_z now contains: close_a, log_price_a, close_b, log_price_b, symbol_a, symbol_b, 
-        # ols_intercept, hedge_ratio, spread, spread_ma, spread_std, zscore
+    merged_df = scenario_result['merged_df']
+    data_with_hedge = scenario_result['data_with_hedge']
+    data_with_z = scenario_result['data_with_z']
+    trade_signals = scenario_result['trade_signals']
+    detailed_trade_log = scenario_result['detailed_trade_log']
 
     if data_with_z.empty or data_with_z['zscore'].isnull().all():
          st.warning("Could not calculate Z-scores. Check data or lookback period.")
@@ -586,18 +227,7 @@ if run_button or optimize_button:
         
         # --- Price History Plot (Existing) ---
         st.subheader(f"📈 Price History: {asset_a_symbol} vs {asset_b_symbol}")
-        fig_prices_plotly = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_prices_plotly.add_trace(
-            go.Scatter(x=merged_df.index, y=merged_df['close_a'], name=asset_a_symbol, line=dict(color='blue')),
-            secondary_y=False,
-        )
-        fig_prices_plotly.add_trace(
-            go.Scatter(x=merged_df.index, y=merged_df['close_b'], name=asset_b_symbol, line=dict(color='red')),
-            secondary_y=True,
-        )
-        fig_prices_plotly.update_layout(title_text=f'Price History: {asset_a_symbol} and {asset_b_symbol}', xaxis_title='Date', legend_title_text='Assets')
-        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_a_symbol} Price</b>", secondary_y=False, color='blue') 
-        fig_prices_plotly.update_yaxes(title_text=f"<b>{asset_b_symbol} Price</b>", secondary_y=True, color='red') 
+        fig_prices_plotly = plot_price_history(merged_df, asset_a_symbol, asset_b_symbol)
         st.plotly_chart(fig_prices_plotly, use_container_width=True)
 
         # --- NEW: Price Percentage Change Correlation Plot ---
@@ -838,3 +468,39 @@ st.sidebar.info("""
 4. Click '**Run Analysis**' for a single backtest or '**Optimize Params**' to find optimal Z-score thresholds.
 The app will fetch data, perform calculations, and display results.
 """)
+
+# --- CLI Mode Functionality ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Statistical Arbitrage CLI Runner")
+    parser.add_argument('--cli', action='store_true', help='Run in CLI mode (no Streamlit UI)')
+    parser.add_argument('--asset_a', type=str, help='Symbol for Asset A (e.g., BTCUSD)')
+    parser.add_argument('--asset_b', type=str, help='Symbol for Asset B (e.g., ETHUSD)')
+    parser.add_argument('--quantity', type=float, default=1.0, help='Quantity of primary asset')
+    parser.add_argument('--timeframe', type=str, default=DEFAULT_CONFIG['timeframe'], help='Timeframe (e.g., 1d)')
+    parser.add_argument('--start_date', type=str, help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--end_date', type=str, help='End date (YYYY-MM-DD)')
+    parser.add_argument('--lookback', type=int, default=DEFAULT_CONFIG['lookback_period'], help='Lookback period (days)')
+    parser.add_argument('--entry', type=float, default=DEFAULT_CONFIG['entry_threshold'], help='Entry Z-score threshold')
+    parser.add_argument('--exit', type=float, default=DEFAULT_CONFIG['exit_threshold'], help='Exit Z-score threshold')
+    parser.add_argument('--stop', type=float, default=DEFAULT_CONFIG['stop_loss_threshold'], help='Stop loss Z-score threshold')
+    parser.add_argument('--fee', type=float, default=DEFAULT_CONFIG['trading_fee'], help='Trading fee')
+    parser.add_argument('--slippage', type=float, default=DEFAULT_CONFIG['slippage'], help='Slippage')
+    parser.add_argument('--api', type=str, default=DEFAULT_CONFIG['api_base_url'], help='API base URL')
+    parser.add_argument('--log', type=str, default='trade_log_output.csv', help='Output log file path')
+    args = parser.parse_args()
+    if args.cli:
+        # Parse dates
+        try:
+            start_date = datetime.strptime(args.start_date, "%Y-%m-%d") if args.start_date else DEFAULT_CONFIG['start_date']
+            end_date = datetime.strptime(args.end_date, "%Y-%m-%d") if args.end_date else DEFAULT_CONFIG['end_date']
+        except Exception as e:
+            print(f"[ERROR] Invalid date format: {e}")
+            exit(1)
+        if not args.asset_a or not args.asset_b:
+            print("[ERROR] --asset_a and --asset_b are required in CLI mode.")
+            exit(1)
+        exit(run_analysis_cli(
+            args.asset_a, args.asset_b, args.quantity, args.timeframe, start_date, end_date,
+            args.lookback, args.entry, args.exit, args.stop, args.fee, args.slippage, args.api, args.log,
+            get_products, get_historical_candles, DEFAULT_CONFIG
+        ))
