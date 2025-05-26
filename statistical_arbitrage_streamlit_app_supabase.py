@@ -15,6 +15,18 @@ import threading
 from supabase import create_client, Client
 from datetime import datetime, timedelta
 import queue
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("streamlit_app.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # --- Configuration (from notebook, can be adjusted in UI) ---
 DEFAULT_CONFIG = {
