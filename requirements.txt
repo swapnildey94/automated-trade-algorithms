@@ -11,3 +11,4 @@ seaborn>=0.13.0
 schedule>=1.2.0
 supabase>=1.0.3
 pytest>=7.4.0
+backtrader>=1.9.78.123
