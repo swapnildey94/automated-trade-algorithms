@@ -9,21 +9,31 @@ import streamlit as st
 import backtrader as bt
 import itertools
 import concurrent.futures
+import tempfile
+import os
 from backtesting import PairTradingStrategy, PairTradingData, run_backtest_with_metrics
+from dataclasses import dataclass, field
+from typing import Any, Dict
 
+@dataclass(frozen=True)
 class OptimizationResult:
     """Class to store optimization results for each parameter combination"""
-    def __init__(self, params, metrics):
-        self.params = params
-        self.metrics = metrics
-        
-        # Extract key metrics
-        self.total_pnl = metrics.get('total_pnl', -np.inf)
-        self.sharpe_ratio = metrics.get('sharpe_ratio', -np.inf)
-        self.sortino_ratio = metrics.get('sortino_ratio', -np.inf)
-        self.max_drawdown = metrics.get('max_drawdown', 100.0)
-        self.win_rate = metrics.get('win_rate', 0.0)
-        self.total_trades = metrics.get('total_trades', 0)
+    params: Dict[str, Any]
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    total_pnl: float = field(init=False)
+    sharpe_ratio: float = field(init=False)
+    sortino_ratio: float = field(init=False)
+    max_drawdown: float = field(init=False)
+    win_rate: float = field(init=False)
+    total_trades: int = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, 'total_pnl', self.metrics.get('total_pnl', float('-inf')))
+        object.__setattr__(self, 'sharpe_ratio', self.metrics.get('sharpe_ratio', float('-inf')))
+        object.__setattr__(self, 'sortino_ratio', self.metrics.get('sortino_ratio', float('-inf')))
+        object.__setattr__(self, 'max_drawdown', self.metrics.get('max_drawdown', 100.0))
+        object.__setattr__(self, 'win_rate', self.metrics.get('win_rate', 0.0))
+        object.__setattr__(self, 'total_trades', self.metrics.get('total_trades', 0))
 
 def run_backtest_for_optimization(params_dict, data_with_z_precalculated, base_config, quantity, primary_is_A):
     """
@@ -49,30 +59,32 @@ def run_backtest_for_optimization(params_dict, data_with_z_precalculated, base_c
     
     return total_pnl
 
-def run_single_backtest(params, data, base_config, quantity, primary_is_A):
+def run_single_backtest(params, data_path, base_config, quantity, primary_is_A):
     """
     Run a single backtest with the given parameters.
     This function is designed to be used with parallel processing.
+    data_path: path to the parquet file containing the DataFrame
     """
+    import pandas as pd
     # Extract parameters
     entry_threshold = params[0]
     exit_threshold = params[1]
     stop_loss_threshold = params[2]
-    
-    # Create a copy of the DataFrame to avoid modifying the original
-    data_copy = data.copy()
-    
+
+    # Load the DataFrame from the parquet file
+    data_copy = pd.read_parquet(data_path)
+
     # Extract symbol information
     symbol_a = data_copy['symbol_a'].iloc[0] if 'symbol_a' in data_copy.columns else "Asset A"
     symbol_b = data_copy['symbol_b'].iloc[0] if 'symbol_b' in data_copy.columns else "Asset B"
-    
+
     # Create a copy without string columns that Backtrader can't handle
     numeric_data = data_copy.copy()
     if 'symbol_a' in numeric_data.columns:
         numeric_data = numeric_data.drop('symbol_a', axis=1)
     if 'symbol_b' in numeric_data.columns:
         numeric_data = numeric_data.drop('symbol_b', axis=1)
-    
+
     # Create a Backtrader cerebro engine
     cerebro = bt.Cerebro()
     
@@ -126,12 +138,12 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
     Returns the best parameters and metrics based on total PnL.
     """
     st.write("Starting parameter optimization with Backtrader...")
-
+    import pandas as pd
+    import tempfile
+    import os
     # --- Session state keys for caching ---
     cache_key = f"opt_results_{hash(str(base_config))}_{quantity}_{primary_is_A}"
     df_key = f"opt_results_df_{hash(str(base_config))}_{quantity}_{primary_is_A}"
-
-    # Check if results are already cached
     if cache_key in st.session_state and df_key in st.session_state:
         results = st.session_state[cache_key]
         all_results_df = st.session_state[df_key]
@@ -140,8 +152,6 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
         entry_thresholds = np.round(np.arange(0.8, 2.1, 0.2), 2)
         exit_thresholds = np.round(np.arange(0.1, 0.8, 0.1), 2)
         stop_loss_thresholds = np.round(np.arange(1.5, 3.6, 0.2), 2)
-        
-        # Generate valid parameter combinations
         valid_combinations = []
         for entry_t in entry_thresholds:
             for exit_t in exit_thresholds:
@@ -151,89 +161,73 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
                     if stop_loss_t <= entry_t or stop_loss_t <= exit_t:
                         continue
                     valid_combinations.append((entry_t, exit_t, stop_loss_t))
-        
         if not valid_combinations:
             st.warning("No valid parameter combinations to test with the defined ranges and constraints. Adjust ranges.")
             return None, -np.inf
-        
         st.write(f"Testing {len(valid_combinations)} valid parameter combinations...")
-        
-        # Set up progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
         status_text.text(f"Optimizing... Total valid combinations to test: {len(valid_combinations)}")
-        
-        # Run optimizations in parallel
         results = []
         completed = 0
-        
-        # Determine the number of workers based on system capabilities
-        max_workers = min(8, len(valid_combinations))  # Limit to 8 workers maximum
-        
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_params = {
-                executor.submit(
-                    run_single_backtest, 
-                    params, 
-                    data_with_z_precalculated, 
-                    base_config, 
-                    quantity, 
-                    primary_is_A
-                ): params for params in valid_combinations
-            }
-            
-            # Process results as they complete
-            for future in concurrent.futures.as_completed(future_to_params):
-                params = future_to_params[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    st.error(f"Error with parameters {params}: {e}")
-                
-                # Update progress
-                completed += 1
-                progress_bar.progress(completed / len(valid_combinations))
-                
-                # Update status text periodically
-                if completed % 5 == 0 or completed == len(valid_combinations):
-                    # Find current best result
-                    if results:
-                        current_best = max(results, key=lambda x: x.total_pnl)
-                        current_best_pnl = f"${current_best.total_pnl:.2f}" if current_best.total_pnl != -np.inf else "N/A"
-                        current_best_params = current_best.params
-                        param_str = ", ".join([f"{k}: {v}" for k, v in current_best_params.items()])
-                        status_text.text(f"Optimizing: {completed}/{len(valid_combinations)} | Current Best PnL: {current_best_pnl} with {param_str}")
-        
-        # Find the best result
-        if not results:
-            st.warning("Optimization did not find any profitable trades with the tested parameter combinations.")
-            return None, -np.inf
-        
-        # Sort results by total PnL
-        results.sort(key=lambda x: x.total_pnl, reverse=True)
-        best_result = results[0]
-        
-        # --- Build DataFrame and cache ---
-        all_results_df = pd.DataFrame([
-            {
-                'Entry Threshold': r.params['entry_threshold'],
-                'Exit Threshold': r.params['exit_threshold'],
-                'Stop Loss': r.params['stop_loss_threshold'],
-                'Total PnL': r.total_pnl,
-                'Sharpe Ratio': r.sharpe_ratio,
-                'Sortino Ratio': r.sortino_ratio,
-                'Max Drawdown': r.max_drawdown,
-                'Win Rate': r.win_rate,
-                'Trades': r.total_trades,
-                'Metrics': r.metrics
-            }
-            for r in results
-        ])
-        st.session_state[cache_key] = results
-        st.session_state[df_key] = all_results_df
-
+        max_workers = min(8, len(valid_combinations))
+        # Write the DataFrame to a temporary Parquet file for worker sharing
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.parquet')
+        data_with_z_precalculated.to_parquet(tmp.name)
+        data_path = tmp.name
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_params = {
+                    executor.submit(
+                        run_single_backtest,
+                        params,
+                        data_path,
+                        base_config,
+                        quantity,
+                        primary_is_A
+                    ): params for params in valid_combinations
+                }
+                for future in concurrent.futures.as_completed(future_to_params):
+                    params = future_to_params[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        st.error(f"Error with parameters {params}: {e}")
+                    completed += 1
+                    progress_bar.progress(completed / len(valid_combinations))
+                    if completed % 5 == 0 or completed == len(valid_combinations):
+                        if results:
+                            current_best = max(results, key=lambda x: x.total_pnl)
+                            current_best_pnl = f"${current_best.total_pnl:.2f}" if current_best.total_pnl != -np.inf else "N/A"
+                            current_best_params = current_best.params
+                            param_str = ", ".join([f"{k}: {v}" for k, v in current_best_params.items()])
+                            status_text.text(f"Optimizing: {completed}/{len(valid_combinations)} | Current Best PnL: {current_best_pnl} with {param_str}")
+            if not results:
+                st.warning("Optimization did not find any profitable trades with the tested parameter combinations.")
+                return None, -np.inf
+            results.sort(key=lambda x: x.total_pnl, reverse=True)
+            best_result = results[0]
+            all_results_df = pd.DataFrame([
+                {
+                    'Entry Threshold': r.params['entry_threshold'],
+                    'Exit Threshold': r.params['exit_threshold'],
+                    'Stop Loss': r.params['stop_loss_threshold'],
+                    'Total PnL': r.total_pnl,
+                    'Sharpe Ratio': r.sharpe_ratio,
+                    'Sortino Ratio': r.sortino_ratio,
+                    'Max Drawdown': r.max_drawdown,
+                    'Win Rate': r.win_rate,
+                    'Trades': r.total_trades,
+                    'Metrics': r.metrics
+                }
+                for r in results
+            ])
+            st.session_state[cache_key] = results
+            st.session_state[df_key] = all_results_df
+        finally:
+            if os.path.exists(data_path):
+                os.remove(data_path)
     best_result = results[0]
     
     # Display optimization results
@@ -259,7 +253,7 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
     
     # Display the top results table
     st.table(pd.DataFrame(top_results))
-    
+
     # --- Show head and tail of all parameter results ---
     all_results_df = pd.DataFrame([
         {
@@ -283,20 +277,11 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
     st.write("#### Tail of all parameter results")
     st.dataframe(all_results_df.tail())
 
-    st.write("#### View trades for a specific parameter set")
-    selected_idx = st.number_input(
-        "Select row index from the table above to view trades (0-based):",
-        min_value=0, max_value=len(all_results_df)-1, value=0, step=1,
-        key=f"trade_row_selector_{df_key}"
-    )
-    selected_params = all_results_df.iloc[selected_idx][['Entry Threshold', 'Exit Threshold', 'Stop Loss']].to_dict()
-    params_dict = {
-        'entry_threshold': selected_params['Entry Threshold'],
-        'exit_threshold': selected_params['Exit Threshold'],
-        'stop_loss_threshold': selected_params['Stop Loss']
-    }
+    # --- Always show trades for the best (top-ranked) parameter set ---
+    st.write("#### Trades for the best optimized parameter set")
+    best_params = best_result.params
     iter_config = base_config.copy()
-    iter_config.update(params_dict)
+    iter_config.update(best_params)
     result = run_backtest_with_metrics(
         data_df=data_with_z_precalculated,
         config_params=iter_config,
@@ -305,7 +290,7 @@ def optimize_strategy_parameters(data_with_z_precalculated, base_config, quantit
     )
     trade_log = result.get('trade_log', pd.DataFrame())
     if not trade_log.empty:
-        st.write("##### Trades for selected parameter set")
+        st.write("##### Trades for best parameter set")
         st.dataframe(trade_log)
     else:
         st.info("No trades for this parameter set.")
@@ -479,7 +464,7 @@ def optimize_with_objective(data_with_z_precalculated, base_config, quantity, pr
     
     # Display the top results table
     st.table(pd.DataFrame(top_results))
-    
+
     # --- Show head and tail of all parameter results ---
     all_results_df = pd.DataFrame([
         {
@@ -503,20 +488,11 @@ def optimize_with_objective(data_with_z_precalculated, base_config, quantity, pr
     st.write("#### Tail of all parameter results")
     st.dataframe(all_results_df.tail())
 
-    st.write("#### View trades for a specific parameter set")
-    selected_idx = st.number_input(
-        "Select row index from the table above to view trades (0-based):",
-        min_value=0, max_value=len(all_results_df)-1, value=0, step=1,
-        key=f"trade_row_selector_{df_key}"
-    )
-    selected_params = all_results_df.iloc[selected_idx][['Entry Threshold', 'Exit Threshold', 'Stop Loss']].to_dict()
-    params_dict = {
-        'entry_threshold': selected_params['Entry Threshold'],
-        'exit_threshold': selected_params['Exit Threshold'],
-        'stop_loss_threshold': selected_params['Stop Loss']
-    }
+    # --- Always show trades for the best (top-ranked) parameter set ---
+    st.write("#### Trades for the best optimized parameter set")
+    best_params = best_result.params
     iter_config = base_config.copy()
-    iter_config.update(params_dict)
+    iter_config.update(best_params)
     result = run_backtest_with_metrics(
         data_df=data_with_z_precalculated,
         config_params=iter_config,
@@ -525,7 +501,7 @@ def optimize_with_objective(data_with_z_precalculated, base_config, quantity, pr
     )
     trade_log = result.get('trade_log', pd.DataFrame())
     if not trade_log.empty:
-        st.write("##### Trades for selected parameter set")
+        st.write("##### Trades for best parameter set")
         st.dataframe(trade_log)
     else:
         st.info("No trades for this parameter set.")

@@ -350,10 +350,10 @@ class PairTradingStrategy(bt.Strategy):
 class PairTradingData(bt.feeds.PandasData):
     lines = ('zscore', 'hedge_ratio', 'close_a', 'close_b')
     params = (
-        ('zscore', None),
-        ('hedge_ratio', None),
-        ('close_a', None),
-        ('close_b', None),
+        ('zscore', 'zscore'),
+        ('hedge_ratio', 'hedge_ratio'),
+        ('close_a', 'close_a'),
+        ('close_b', 'close_b'),
     )
 
 # Main function to generate trade signals using Backtrader
@@ -418,7 +418,11 @@ def generate_trade_signals(data_df, config_params):
     for trade in strategy.trades:
         entry_idx = data_df.index.get_indexer([trade['Entry Timestamp']], method='nearest')[0]
         exit_idx = data_df.index.get_indexer([trade['Exit Timestamp']], method='nearest')[0]
-        
+        # Check for valid indices
+        if entry_idx == -1 or exit_idx == -1:
+            # Optionally log a warning or raise an error
+            print(f"Warning: Could not find matching index for trade entry or exit. Skipping trade: {trade}")
+            continue
         # Set entry signal
         if 'Buy Spread' in trade['Trade Type']:
             signals.loc[signals.index[entry_idx], 'signal'] = 1.0
@@ -430,7 +434,6 @@ def generate_trade_signals(data_df, config_params):
             for i in range(entry_idx, exit_idx + 1):
                 if i < len(signals):
                     signals.loc[signals.index[i], 'position'] = -1
-        
         # Set exit signal
         signals.loc[signals.index[exit_idx], 'signal'] = 2.0
     
